@@ -56,7 +56,7 @@ void UpdateChecker::loop() {
 
         // ESP32: Check 2 minutes after boot, then every 24 hours
         if (_lastAutoCheck == 0) {
-            if (now - _bootTime >= 30000) {
+            if (now - _bootTime >= 120000) {
                 shouldAutoCheck = true;
             }
         } else if (now - _lastAutoCheck >= UPDATE_CHECK_INTERVAL) {
