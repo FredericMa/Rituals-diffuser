@@ -481,8 +481,8 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     const DiffuserSettings& settings = storage.getSettings();  // Use cache, no NVS read
 
     // Use DynamicJsonDocument to avoid stack overflow on ESP8266 (limited 4KB stack)
-    // Size increased to 1280 to include RFID data on ESP32-C3
-    DynamicJsonDocument doc(1280);  // Heap allocation, includes update + RFID info
+    // Size includes update info (release_url, error) + RFID data
+    DynamicJsonDocument doc(1408);  // Heap allocation
 
     // WiFi status
     doc["wifi"]["connected"] = wifiManager.isConnected();
@@ -530,8 +530,10 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     doc["update"]["available"] = updateChecker.isUpdateAvailable();
     doc["update"]["current"] = updateChecker.getCurrentVersion();
     doc["update"]["latest"] = updateChecker.getLatestVersion();
+    doc["update"]["release_url"] = updateChecker.getReleaseUrl();
     doc["update"]["state"] = (int)updateChecker.getState();
     doc["update"]["progress"] = updateChecker.getDownloadProgress();
+    doc["update"]["error"] = updateChecker.getErrorMessage();
     #ifndef PLATFORM_ESP8266
     doc["update"]["can_auto_update"] = true;
     #else

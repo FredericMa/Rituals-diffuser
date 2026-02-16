@@ -280,10 +280,8 @@ void setup() {
     // Initialize web server
     webServer.begin();
 
-    // Initialize update checker (ESP32 only - ESP8266 can't handle this due to RAM)
-#ifndef PLATFORM_ESP8266
+    // Initialize update checker
     updateChecker.begin();
-#endif
 
     // Initialize RFID (all platforms with RC522_ENABLED)
 #if defined(RC522_ENABLED)
@@ -328,9 +326,7 @@ void loop() {
     webServer.loop();  // Process pending web actions
     yield();
 
-#ifndef PLATFORM_ESP8266
-    updateChecker.loop();  // Check for firmware updates (ESP32 only)
-#endif
+    updateChecker.loop();  // Check for firmware updates
 
     // Run MQTT loop with extra yield time
     mqttHandler.loop();

@@ -1,7 +1,6 @@
 const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
 const circumference=2*Math.PI*54;
 let state={on:false,speed:50};
-let isESP8266=false; // Platform detection - update features disabled on ESP8266
 
 // Polling interval management - pause when tab is hidden to save resources
 let pollInterval=setInterval(fetchStatusLite,5000);
@@ -110,18 +109,10 @@ function update(d){
             $$('.version').forEach(el=>el.textContent='v'+d.device.version);
             $('#footer-version').textContent='v'+d.device.version;
         }
-        // Platform detection - hide update section on ESP8266
-        if(d.device.platform){
-            isESP8266=d.device.platform==='ESP8266';
-            if(isESP8266){
-                $('#update-section')?.setAttribute('hidden','');
-                $('#update-banner')?.classList.add('hidden');
-            }
-        }
     }
 
-    // Update info from status (ESP32 only)
-    if(d.update&&!isESP8266){
+    // Update info from status
+    if(d.update){
         updateUpdateUI(d.update);
     }
 
@@ -582,7 +573,7 @@ function updateUpdateUI(d){
     }
 
     // Set GitHub links
-    const releaseUrl='https://github.com/martijnrenkema/Rituals-diffuser/releases';
+    const releaseUrl=d.release_url||'https://github.com/martijnrenkema/Rituals-diffuser/releases';
     $('#download-link').href=releaseUrl;
     $('#banner-github').href=releaseUrl;
 
@@ -596,8 +587,6 @@ function updateUpdateUI(d){
 }
 
 async function fetchUpdateStatus(){
-    // Skip on ESP8266 - no update checker running
-    if(isESP8266)return null;
     try{
         const r=await fetch('/api/update/status');
         const d=await r.json();
@@ -614,9 +603,11 @@ $('#check-update')?.addEventListener('click',async()=>{
     $('#update-state').textContent='Checking...';
     try{
         await fetch('/api/update/check',{method:'POST'});
-        // Poll for result after a few seconds
+        // Poll for result - ESP8266 HTTPS check can take 5-10 seconds
         setTimeout(fetchUpdateStatus,3000);
         setTimeout(fetchUpdateStatus,6000);
+        setTimeout(fetchUpdateStatus,10000);
+        setTimeout(fetchUpdateStatus,15000);
     }catch(e){
         $('#update-state').textContent='Error';
     }
