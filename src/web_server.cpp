@@ -11,7 +11,7 @@
 #include <ArduinoJson.h>
 
 // RFID support for all platforms with RC522_ENABLED
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 #include "rfid_handler.h"
 #endif
 
@@ -296,8 +296,11 @@ void WebServer::setupRoutes() {
                 updateLedStatus();
                 updateContentLength = request->contentLength();
 
-                // Stop non-essential services to free memory
+                // Stop non-essential services to free memory and prevent interference
                 mqttHandler.disconnect();
+                #if RC522_ENABLED
+                rfidSuspend();  // Stop SPI operations that compete with TCP stack
+                #endif
 
                 #ifdef PLATFORM_ESP8266
                 if (!Update.begin(updateContentLength, U_FLASH)) {
@@ -365,8 +368,11 @@ void WebServer::setupRoutes() {
                 otaInProgress = true;
                 updateLedStatus();
 
-                // Stop non-essential services to free memory
+                // Stop non-essential services to free memory and prevent interference
                 mqttHandler.disconnect();
+                #if RC522_ENABLED
+                rfidSuspend();  // Stop SPI operations that compete with TCP stack
+                #endif
 
                 #ifdef PLATFORM_ESP8266
                 size_t fsSize = ((size_t)&_FS_end - (size_t)&_FS_start);
@@ -481,8 +487,8 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     const DiffuserSettings& settings = storage.getSettings();  // Use cache, no NVS read
 
     // Use DynamicJsonDocument to avoid stack overflow on ESP8266 (limited 4KB stack)
-    // Size increased to 1280 to include RFID data on ESP32-C3
-    DynamicJsonDocument doc(1280);  // Heap allocation, includes update + RFID info
+    // Size includes update info (release_url, error) + RFID data
+    DynamicJsonDocument doc(1408);  // Heap allocation
 
     // WiFi status
     doc["wifi"]["connected"] = wifiManager.isConnected();
@@ -530,8 +536,10 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     doc["update"]["available"] = updateChecker.isUpdateAvailable();
     doc["update"]["current"] = updateChecker.getCurrentVersion();
     doc["update"]["latest"] = updateChecker.getLatestVersion();
+    doc["update"]["release_url"] = updateChecker.getReleaseUrl();
     doc["update"]["state"] = (int)updateChecker.getState();
     doc["update"]["progress"] = updateChecker.getDownloadProgress();
+    doc["update"]["error"] = updateChecker.getErrorMessage();
     #ifndef PLATFORM_ESP8266
     doc["update"]["can_auto_update"] = true;
     #else
@@ -539,7 +547,7 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     #endif
 
     // RFID status
-    #if defined(RC522_ENABLED)
+    #if RC522_ENABLED
     doc["rfid"]["connected"] = rfidIsConnected();
     doc["rfid"]["has_tag"] = rfidHasTag();
     doc["rfid"]["cartridge_present"] = rfidIsCartridgePresent();  // Is cartridge NOW present?
@@ -566,7 +574,7 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     // Lite status endpoint for frequent polling - uses StaticJsonDocument on STACK
     // to avoid heap allocation and fragmentation on ESP8266
     // Contains only data needed for UI polling updates
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<448> doc;
 
     // Fan status (essential for UI updates)
     doc["fan"]["on"] = fanController.isOn();
@@ -584,10 +592,12 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     doc["mqtt"]["connected"] = mqttHandler.isConnected();
 
     // RFID status (only if enabled)
-    #if defined(RC522_ENABLED)
+    #if RC522_ENABLED
     doc["rfid"]["connected"] = rfidIsConnected();
     doc["rfid"]["cartridge_present"] = rfidIsCartridgePresent();
+    doc["rfid"]["has_tag"] = rfidHasTag();
     doc["rfid"]["last_scent"] = rfidGetLastScent();
+    doc["rfid"]["last_uid"] = rfidGetLastUID();
     #endif
 
     String response;

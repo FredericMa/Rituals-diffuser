@@ -42,6 +42,10 @@ void UpdateChecker::begin() {
 }
 
 void UpdateChecker::loop() {
+    // Don't run any network operations during firmware upload
+    extern bool otaInProgress;
+    if (otaInProgress) return;
+
     // Handle requested check
     if (_checkRequested && _state == UpdateCheckState::IDLE) {
         _checkRequested = false;
@@ -53,14 +57,7 @@ void UpdateChecker::loop() {
         unsigned long now = millis();
         bool shouldAutoCheck = false;
 
-#ifdef PLATFORM_ESP8266
-        // ESP8266: Only check ONCE, 15 seconds after boot
-        // This runs before MQTT is fully connected, when more heap is available
-        // Skip periodic checks - not enough RAM for BearSSL TLS after everything starts
-        if (_lastAutoCheck == 0 && (now - _bootTime >= 15000)) {
-            shouldAutoCheck = true;
-        }
-#else
+
         // ESP32: Check 2 minutes after boot, then every 24 hours
         if (_lastAutoCheck == 0) {
             if (now - _bootTime >= 120000) {
@@ -69,7 +66,6 @@ void UpdateChecker::loop() {
         } else if (now - _lastAutoCheck >= UPDATE_CHECK_INTERVAL) {
             shouldAutoCheck = true;
         }
-#endif
 
         if (shouldAutoCheck) {
             _lastAutoCheck = now;
@@ -147,8 +143,8 @@ bool UpdateChecker::fetchGitHubRelease() {
 
     #ifdef PLATFORM_ESP8266
     // ESP8266 has limited RAM (~80KB) - reduce BearSSL buffers from default 16KB
-    // This prevents OOM when making HTTPS requests
-    client.setBufferSizes(512, 512);
+    // rx=1024 is minimum reliable size for GitHub TLS records
+    client.setBufferSizes(1024, 512);
     client.setInsecure();  // Skip certificate verification
     client.setTimeout(UPDATE_CHECK_TIMEOUT);
     logger.infof("Free heap: %d bytes", ESP.getFreeHeap());
@@ -159,6 +155,11 @@ bool UpdateChecker::fetchGitHubRelease() {
     HTTPClient http;
     http.setTimeout(UPDATE_CHECK_TIMEOUT);
     http.setUserAgent("ESP-Rituals-Diffuser/" FIRMWARE_VERSION);
+    // HTTP/1.0 avoids chunked transfer encoding - ensures Content-Length is present
+    // This makes stream-based JSON parsing reliable on both platforms
+    http.useHTTP10(true);
+
+    // Follow redirects on all platforms
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
     if (!http.begin(client, GITHUB_API_URL)) {
@@ -185,31 +186,21 @@ bool UpdateChecker::fetchGitHubRelease() {
         return false;
     }
 
-    // Get response
-    String payload = http.getString();
-    http.end();
+    logger.info("GitHub release fetched successfully");
 
-    if (payload.length() == 0) {
-        strlcpy(_info.errorMessage, "Empty response", sizeof(_info.errorMessage));
-        return false;
-    }
-
-    return parseReleaseJson(payload.c_str(), payload.length());
-}
-
-bool UpdateChecker::parseReleaseJson(const char* json, size_t length) {
-    // Use a filter to only parse the fields we need (reduces memory usage significantly)
-    // GitHub API response is ~10KB but we only need a few fields
+    // Parse JSON directly from HTTP stream - avoids allocating full response (~10KB) as String
+    // This is critical for ESP8266 where getString() fails silently when heap is low
     StaticJsonDocument<200> filter;
     filter["tag_name"] = true;
     filter["html_url"] = true;
     filter["assets"][0]["name"] = true;
     filter["assets"][0]["browser_download_url"] = true;
 
-    // Parse JSON response with filter - this drastically reduces memory needed
-    // Reduced from 2048 to 1536 bytes for better ESP8266 memory usage
     DynamicJsonDocument doc(1536);
-    DeserializationError err = deserializeJson(doc, json, length, DeserializationOption::Filter(filter));
+    WiFiClient* stream = http.getStreamPtr();
+    DeserializationError err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+
+    http.end();
 
     if (err) {
         snprintf(_info.errorMessage, sizeof(_info.errorMessage), "JSON error: %s", err.c_str());
@@ -248,7 +239,6 @@ bool UpdateChecker::parseReleaseJson(const char* json, size_t length) {
             const char* downloadUrl = asset["browser_download_url"];
             if (downloadUrl) {
                 #ifdef ESP32C3_SUPERMINI
-                // ESP32-C3: Look for esp32c3 binaries
                 if (strstr(name, "firmware") != nullptr && strstr(name, "esp32c3") != nullptr) {
                     strlcpy(_info.downloadUrl, downloadUrl, sizeof(_info.downloadUrl));
                 }
@@ -256,7 +246,6 @@ bool UpdateChecker::parseReleaseJson(const char* json, size_t length) {
                     strlcpy(_info.spiffsUrl, downloadUrl, sizeof(_info.spiffsUrl));
                 }
                 #else
-                // Standard ESP32: Look for esp32 binaries but NOT esp32c3
                 if (strstr(name, "firmware") != nullptr && strstr(name, "esp32") != nullptr && strstr(name, "esp32c3") == nullptr) {
                     strlcpy(_info.downloadUrl, downloadUrl, sizeof(_info.downloadUrl));
                 }

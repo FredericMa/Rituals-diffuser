@@ -8,8 +8,8 @@
 
 // Geur informatie struct
 struct ScentInfo {
-    String name;
-    String hexCode;
+    const char* name;    // Points to PROGMEM string, do NOT free
+    const char* hexCode; // Points to caller-owned buffer
     bool valid;
 };
 
@@ -20,10 +20,10 @@ bool rfidInit();
 void rfidLoop();
 
 // Haal de laatst gedetecteerde tag UID op
-String rfidGetLastUID();
+const char* rfidGetLastUID();
 
 // Haal de laatst gedetecteerde geur op
-String rfidGetLastScent();
+const char* rfidGetLastScent();
 
 // Is er recent een tag gedetecteerd?
 bool rfidHasTag();
@@ -35,13 +35,17 @@ bool rfidIsCartridgePresent();
 unsigned long rfidTimeSinceLastTag();
 
 // Lookup geur naam op basis van UID
-ScentInfo rfidLookupScent(const String& uid);
+ScentInfo rfidLookupScent(const char* hexData);
 
 // Is de RC522 geïnitialiseerd en werkend?
 bool rfidIsConnected();
 
 // Debug: Get the version register value read during init (0 if not read)
 uint8_t rfidGetVersionReg();
+
+// Suspend/resume RFID scanning (e.g. during firmware upload)
+void rfidSuspend();
+void rfidResume();
 
 #endif // RC522_ENABLED
 
