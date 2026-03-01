@@ -574,7 +574,7 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     // Lite status endpoint for frequent polling - uses StaticJsonDocument on STACK
     // to avoid heap allocation and fragmentation on ESP8266
     // Contains only data needed for UI polling updates
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<448> doc;
 
     // Fan status (essential for UI updates)
     doc["fan"]["on"] = fanController.isOn();
@@ -595,7 +595,9 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     #if RC522_ENABLED
     doc["rfid"]["connected"] = rfidIsConnected();
     doc["rfid"]["cartridge_present"] = rfidIsCartridgePresent();
+    doc["rfid"]["has_tag"] = rfidHasTag();
     doc["rfid"]["last_scent"] = rfidGetLastScent();
+    doc["rfid"]["last_uid"] = rfidGetLastUID();
     #endif
 
     String response;

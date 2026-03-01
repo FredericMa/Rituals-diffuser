@@ -41,18 +41,28 @@ function updateLite(d){
     }
     updateFan(d.fan);
 
-    // RFID status (lite version)
+    // RFID status (lite version) - mirrors updateExtended logic
     if(d.rfid){
         const dot=$('#rfid-dot');
         if(d.rfid.cartridge_present){
             dot?.classList.add('on');
             dot?.classList.remove('scanning');
             if(d.rfid.last_scent)$('#scent-name').textContent=d.rfid.last_scent;
+            if(d.rfid.last_uid)$('#scent-uid').textContent='UID: '+d.rfid.last_uid;
+        }else if(d.rfid.has_tag&&d.rfid.last_scent){
+            dot?.classList.remove('on');
+            dot?.classList.add('scanning');
+            $('#scent-name').textContent=d.rfid.last_scent+' (removed)';
+            $('#scent-uid').textContent='Place cartridge back on reader';
         }else if(d.rfid.connected){
             dot?.classList.remove('on');
             dot?.classList.add('scanning');
+            $('#scent-name').textContent='No cartridge detected';
+            $('#scent-uid').textContent='Place a Rituals cartridge on the reader';
         }else{
             dot?.classList.remove('on','scanning');
+            $('#scent-name').textContent='RFID reader not connected';
+            $('#scent-uid').textContent='Check wiring';
         }
     }
 }
