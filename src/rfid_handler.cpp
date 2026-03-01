@@ -21,17 +21,34 @@ static unsigned long lastScanTime = 0;
 static bool hasValidTag = false;
 static bool cartridgePresent = false;
 
-// Timeout: als geen tag gedetecteerd in 5 seconden, is cartridge verwijderd
-#define CARTRIDGE_TIMEOUT_MS 5000
-// Scan interval: check elke 1000ms of cartridge nog aanwezig is
-#define SCAN_INTERVAL_MS 1000
-// After this many consecutive failed wakeups, do a full PCD_Init recovery
-// Set high enough that it doesn't fire during normal "no cartridge" operation
-// (at 1s scan interval, 30 = recovery after 30 seconds of continuous failure)
-#define RFID_RECOVERY_THRESHOLD 30
+// Scan intervals (ms) - longer when cartridge present to reduce SPI load
+#define SCAN_INTERVAL_DETECT_MS  1000  // When waiting for new cartridge
+#define SCAN_INTERVAL_PRESENT_MS 2000  // When confirming presence (less critical)
+// Declare cartridge removed after N consecutive failed WUPA scans.
+// Count-based (not time-based) so intermittent reads through metal enclosure
+// don't cause false "cartridge removed" events.
+#define CARTRIDGE_MISS_THRESHOLD 5     // 5 misses at 2s = ~10s before removal
+// After N consecutive failures (no card), do a full PCD_Init recovery
+#define RFID_RECOVERY_THRESHOLD  30
 
 static uint8_t consecutiveFailures = 0;
+static uint8_t consecutiveScanMisses = 0;
 static bool rfidSuspended = false;
+
+// Reduce the MFRC522 transceive timeout from default 25ms to 15ms.
+// ISO 14443-A cards respond within ~91μs; 15ms is generous margin for metal enclosures.
+// NOTE: PCD_CommunicateWithPICC() already calls yield() inside its busy-wait loop,
+// so the WiFi stack is not fully starved during a scan. The primary RF interference
+// source is the CONSTANT 13.56MHz carrier from PCD_AntennaOn() — mitigated by
+// calling PCD_AntennaOff() after each scan (antenna-off approach below).
+static void rfidSetFastTimeout() {
+    if (mfrc522 == nullptr) return;
+    // Timer freq = 13.56MHz / (2*(169+1)) ≈ 40kHz (set by PCD_Init)
+    // PCD_Init sets reload 1000 (0x03E8) = 25ms; we override to 600 (0x0258) = 15ms
+    // 15ms is safer than 10ms through metal enclosure (more margin for weak field)
+    mfrc522->PCD_WriteRegister(mfrc522->TReloadRegH, 0x02);
+    mfrc522->PCD_WriteRegister(mfrc522->TReloadRegL, 0x58);
+}
 
 // Geurtabel - officieel gedeeld
 // Use PROGMEM to store table in Flash instead of RAM (no-op on ESP32)
@@ -225,6 +242,19 @@ bool rfidInit() {
         // and is purely diagnostic — a successful version register read already
         // confirms SPI communication and RC522 functionality.
 
+        // Maximize receiver gain for metal enclosure environments
+        mfrc522->PCD_SetAntennaGain(mfrc522->RxGain_max);
+        Serial.println("[RFID] Antenna gain set to maximum");
+
+        // Reduce transceive timeout from 25ms to 15ms
+        rfidSetFastTimeout();
+        Serial.println("[RFID] Transceive timeout set to 15ms");
+
+        // Turn antenna off after init — it will be toggled on/off per scan
+        // to eliminate constant 13.56MHz RF emission between scans (WiFi stability)
+        mfrc522->PCD_AntennaOff();
+        Serial.println("[RFID] Antenna off (will be toggled per scan)");
+
         return true;
     } else {
         rc522Connected = false;
@@ -254,43 +284,77 @@ void rfidLoop() {
 
     unsigned long now = millis();
 
-    // Check timeout - cartridge verwijderd?
-    if (cartridgePresent && (now - lastTagTime > CARTRIDGE_TIMEOUT_MS)) {
-        cartridgePresent = false;
-        Serial.println("[RFID] Cartridge removed (timeout)");
-        mqttHandler.requestStatePublish();  // Notify MQTT immediately
-    }
-
-    // Scan niet te vaak (elke 1000ms)
-    if (now - lastScanTime < SCAN_INTERVAL_MS) {
+    // Use longer interval when cartridge is confirmed present (less SPI contention)
+    unsigned long interval = cartridgePresent ? SCAN_INTERVAL_PRESENT_MS : SCAN_INTERVAL_DETECT_MS;
+    if (now - lastScanTime < interval) {
         return;
     }
     lastScanTime = now;
 
-    // Check voor kaart (nieuw of bestaand)
-    if (!mfrc522->PICC_IsNewCardPresent()) {
-        // Probeer bestaande kaart opnieuw te wekken via WUPA command
-        // NOTE: PICC_WakeupA already clears the collision register internally,
-        // so PCD_Init() is NOT needed here. PCD_Init() contains PCD_Reset() with
-        // a blocking delay(50) that starves WiFi/MQTT/WebServer on ESP8266.
+    // ============================================================
+    // MODE 1: PRESENCE CHECK (cartridge already detected)
+    // ============================================================
+    // Antenna was off since last scan. Turn it on briefly, send WUPA
+    // to confirm card is still in the RF field, then turn antenna off.
+    // WUPA wakes HALT-state and IDLE-state (power-cycled) cards.
+    // Antenna-off between scans reduces 13.56MHz RF interference with WiFi.
+    if (cartridgePresent) {
+        mfrc522->PCD_AntennaOn();
+        delay(5);  // Allow card to power up from RF field (~5ms)
+
         byte bufferATQA[2];
         byte bufferSize = sizeof(bufferATQA);
         MFRC522::StatusCode status = mfrc522->PICC_WakeupA(bufferATQA, &bufferSize);
-        if (status != MFRC522::STATUS_OK) {
+
+        mfrc522->PCD_AntennaOff();  // RF off immediately after scan
+
+        if (status == MFRC522::STATUS_OK) {
+            // Card still in field - reset counters
+            consecutiveFailures = 0;
+            consecutiveScanMisses = 0;
+            lastTagTime = now;
+        } else {
             consecutiveFailures++;
-            // After many failures, do a full PCD_Init once to recover from
-            // potential RC522 lockup (e.g. after ESD event or power glitch)
+            consecutiveScanMisses++;
+
+            // Count-based removal: only declare removed after N consecutive misses
+            if (consecutiveScanMisses >= CARTRIDGE_MISS_THRESHOLD) {
+                cartridgePresent = false;
+                consecutiveScanMisses = 0;
+                Serial.println("[RFID] Cartridge removed");
+                mqttHandler.requestStatePublish();
+            }
+
+            // Full PCD_Init recovery after many consecutive failures
             if (consecutiveFailures >= RFID_RECOVERY_THRESHOLD) {
                 mfrc522->PCD_Init();
+                mfrc522->PCD_SetAntennaGain(mfrc522->RxGain_max);
+                rfidSetFastTimeout();
+                mfrc522->PCD_AntennaOff();  // Keep antenna off after recovery
                 consecutiveFailures = 0;
             }
-            return;  // Geen kaart aanwezig
         }
-        consecutiveFailures = 0;
+        return;  // Done - one SPI operation per loop iteration
     }
 
-    // Selecteer de kaart
+    // ============================================================
+    // MODE 2: DETECTION (no cartridge, waiting for new card)
+    // ============================================================
+    // Turn antenna on, send REQA, then off again (antenna-off per scan).
+    // New/idle cards respond to REQA. Card was power-cycled so it's in IDLE state.
+    mfrc522->PCD_AntennaOn();
+    delay(5);  // Allow card to power up from RF field
+
+    bool cardFound = mfrc522->PICC_IsNewCardPresent();
+
+    if (!cardFound) {
+        mfrc522->PCD_AntennaOff();  // RF off - no card found
+        return;
+    }
+
+    // New card responding! Select it (antenna still on).
     if (!mfrc522->PICC_ReadCardSerial()) {
+        mfrc522->PCD_AntennaOff();
         return;
     }
 
@@ -316,9 +380,9 @@ void rfidLoop() {
 
     // Als het dezelfde kaart is, alleen timestamp updaten en stoppen
     if (!isNewCard) {
-        // Halt PICC om stroom te besparen
+        // Halt PICC and turn antenna off until next scan
         mfrc522->PICC_HaltA();
-        yield();  // Give WiFi/TCP stack time after SPI operations
+        mfrc522->PCD_AntennaOff();
         return;
     }
 
@@ -377,10 +441,9 @@ void rfidLoop() {
     // Notify MQTT of new cartridge
     mqttHandler.requestStatePublish();
 
-    // Halt PICC
+    // Halt PICC and turn antenna off until next scan
     mfrc522->PICC_HaltA();
-
-    yield();  // Give WiFi/TCP stack time after SPI-heavy new card processing
+    mfrc522->PCD_AntennaOff();
 }
 
 const char* rfidGetLastUID() {
@@ -460,7 +523,8 @@ void rfidResume() {
     if (mfrc522 != nullptr && rc522Connected) {
         mfrc522->PCD_AntennaOn();
     }
-    consecutiveFailures = 0;  // Reset so recovery doesn't fire immediately
+    consecutiveFailures = 0;
+    consecutiveScanMisses = 0;
     Serial.println("[RFID] Resumed");
 }
 
