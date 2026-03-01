@@ -20,7 +20,7 @@
 #endif
 
 // RFID support for all platforms with RC522_ENABLED
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 #include "rfid_handler.h"
 #endif
 
@@ -33,6 +33,11 @@ unsigned long lastNightModeCheck = 0;
 
 // OTA state tracking
 bool otaInProgress = false;
+
+// Deferred RFID init - runs after MQTT discovery completes
+#if RC522_ENABLED
+bool rfidInitialized = false;
+#endif
 
 // Configure NTP time sync
 void setupTimeSync() {
@@ -283,14 +288,9 @@ void setup() {
     // Initialize update checker
     updateChecker.begin();
 
-    // Initialize RFID (all platforms with RC522_ENABLED)
-#if defined(RC522_ENABLED)
-    if (rfidInit()) {
-        Serial.println("[MAIN] RFID reader initialized");
-    } else {
-        Serial.println("[MAIN] RFID reader NOT detected - check wiring");
-    }
-#endif
+    // NOTE: RFID init is deferred to loop() after MQTT discovery completes.
+    // rfidInit() takes ~300ms of blocking delays (SPI + reset + self-test) which
+    // would delay WiFi connection and MQTT discovery if run here.
 
     // Ensure LED shows correct status after all initialization
     // This handles the case where WiFi was already connected via SDK auto-reconnect
@@ -337,9 +337,30 @@ void loop() {
         logger.save();
     }
 
-    // RFID loop (all platforms with RC522_ENABLED)
-#if defined(RC522_ENABLED)
-    rfidLoop();
+    // RFID: deferred init + loop (all platforms with RC522_ENABLED)
+    // Skip entirely during OTA to prevent SPI interference with flash writes
+#if RC522_ENABLED
+    if (!otaInProgress) {
+        if (!rfidInitialized) {
+            // Wait until MQTT discovery is done (or MQTT not configured/not connected)
+            // This ensures the ~200ms blocking rfidInit() doesn't interrupt
+            // the discovery state machine or initial WiFi connection
+            bool mqttReady = !storage.hasMQTTConfig() || !mqttHandler.isConnected() 
+                             || mqttHandler.isDiscoveryDone();
+            bool wifiSettled = wifiManager.isConnected() || wifiManager.isAPMode();
+            if (mqttReady && wifiSettled) {
+                Serial.println("[MAIN] Deferred RFID init starting...");
+                rfidInitialized = true;
+                if (rfidInit()) {
+                    Serial.println("[MAIN] RFID reader initialized");
+                } else {
+                    Serial.println("[MAIN] RFID reader NOT detected - check wiring");
+                }
+            }
+        } else {
+            rfidLoop();
+        }
+    }
 #endif
 
     // Periodic tasks every minute

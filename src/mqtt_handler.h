@@ -71,6 +71,9 @@ public:
         interrupts();
     }
 
+    // Check if HA discovery has completed (safe for startup sequencing)
+    bool isDiscoveryDone() const { return _discoveryPublished; }
+
     // Callbacks
     typedef void (*CommandCallback)(const char* topic, const char* payload);
     void onCommand(CommandCallback callback);

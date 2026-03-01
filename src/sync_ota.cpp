@@ -12,6 +12,10 @@
 #include "led_controller.h"
 // Note: Don't include logger.h - we avoid flash writes during OTA
 
+#if RC522_ENABLED
+#include "rfid_handler.h"
+#endif
+
 // External variables from main.cpp
 extern bool otaInProgress;
 extern void updateLedStatus();
@@ -131,6 +135,12 @@ void runSyncOTAServer() {
     // Stop MQTT to free memory and prevent interference
     mqttHandler.disconnect();
     Serial.println("[OTA-SYNC] MQTT disconnected");
+
+    // Stop RFID to prevent SPI interference during flash writes
+    #if RC522_ENABLED
+    rfidSuspend();
+    Serial.println("[OTA-SYNC] RFID suspended");
+    #endif
 
     // Stop the async web server by calling its stop method
     // We use extern to access it without including the header

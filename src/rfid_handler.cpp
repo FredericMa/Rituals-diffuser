@@ -1,6 +1,6 @@
 #include "rfid_handler.h"
 
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 
 #include <SPI.h>
 #include <MFRC522.h>
@@ -25,6 +25,13 @@ static bool cartridgePresent = false;
 #define CARTRIDGE_TIMEOUT_MS 5000
 // Scan interval: check elke 1000ms of cartridge nog aanwezig is
 #define SCAN_INTERVAL_MS 1000
+// After this many consecutive failed wakeups, do a full PCD_Init recovery
+// Set high enough that it doesn't fire during normal "no cartridge" operation
+// (at 1s scan interval, 30 = recovery after 30 seconds of continuous failure)
+#define RFID_RECOVERY_THRESHOLD 30
+
+static uint8_t consecutiveFailures = 0;
+static bool rfidSuspended = false;
 
 // Geurtabel - officieel gedeeld
 // Use PROGMEM to store table in Flash instead of RAM (no-op on ESP32)
@@ -95,11 +102,11 @@ static const ScentEntry scentTable[] PROGMEM = {
 
     {"6F7564", "Private Collection Black Oudh"},          // "oud" ASCII lowercase
     {"4F7564", "Private Collection Black Oudh"},          // "Oud" ASCII uppercase
-    {"0426C6", "Private Collection Black Oudh"},          // Officieel
+    {"0426C6", "Private Collection Black Oudh"},          // Officieel  ⚠ DUPLICATE: also used by Cotton Blossom
 
     {"616D62", "Private Collection Precious Amber"},      // "amb" ASCII lowercase
     {"416D62", "Private Collection Precious Amber"},      // "Amb" ASCII uppercase
-    {"057265", "Private Collection Precious Amber"},      // Officieel
+    {"057265", "Private Collection Precious Amber"},      // Officieel  ⚠ DUPLICATE: also used by Green Cardamom
 
     {"6A6173", "Private Collection Sweet Jasmine"},       // "jas" ASCII lowercase
     {"4A6173", "Private Collection Sweet Jasmine"},       // "Jas" ASCII uppercase
@@ -119,11 +126,11 @@ static const ScentEntry scentTable[] PROGMEM = {
 
     {"636F74", "Private Collection Cotton Blossom"},      // "cot" ASCII lowercase
     {"436F74", "Private Collection Cotton Blossom"},      // "Cot" ASCII uppercase
-    {"0426C6", "Private Collection Cotton Blossom"},      // Officieel
+    {"0426C6", "Private Collection Cotton Blossom"},      // Officieel  ⚠ DUPLICATE: same as Black Oudh (first match wins)
 
     {"636172", "Private Collection Green Cardamom"},      // "car" ASCII lowercase
     {"436172", "Private Collection Green Cardamom"},      // "Car" ASCII uppercase
-    {"047265", "Private Collection Green Cardamom"},      // Officieel
+    {"047265", "Private Collection Green Cardamom"},      // Officieel  ⚠ DUPLICATE: same as Precious Amber (first match wins)
 
     {"746561", "Private Collection Royal Tea"},           // "tea" ASCII lowercase
     {"546561", "Private Collection Royal Tea"},           // "Tea" ASCII uppercase
@@ -213,13 +220,10 @@ bool rfidInit() {
         else if (version == 0x88) Serial.println(" (clone)");
         else Serial.println();
 
-        // Perform self-test
-        Serial.println("[RFID] RC522 self-test...");
-        bool selfTestOk = mfrc522->PCD_PerformSelfTest();
-        Serial.printf("[RFID] Self-test result: %s\n", selfTestOk ? "PASS" : "FAIL");
-
-        // Re-init after self-test (self-test disables crypto)
-        mfrc522->PCD_Init();
+        // NOTE: Self-test (PCD_PerformSelfTest) deliberately omitted.
+        // It takes ~60ms blocking, disables crypto (requiring another PCD_Init),
+        // and is purely diagnostic — a successful version register read already
+        // confirms SPI communication and RC522 functionality.
 
         return true;
     } else {
@@ -244,7 +248,7 @@ bool rfidInit() {
 }
 
 void rfidLoop() {
-    if (!rc522Connected || mfrc522 == nullptr) {
+    if (!rc522Connected || mfrc522 == nullptr || rfidSuspended) {
         return;
     }
 
@@ -265,14 +269,24 @@ void rfidLoop() {
 
     // Check voor kaart (nieuw of bestaand)
     if (!mfrc522->PICC_IsNewCardPresent()) {
-        // Probeer bestaande kaart opnieuw te wekken
+        // Probeer bestaande kaart opnieuw te wekken via WUPA command
+        // NOTE: PICC_WakeupA already clears the collision register internally,
+        // so PCD_Init() is NOT needed here. PCD_Init() contains PCD_Reset() with
+        // a blocking delay(50) that starves WiFi/MQTT/WebServer on ESP8266.
         byte bufferATQA[2];
         byte bufferSize = sizeof(bufferATQA);
-        mfrc522->PCD_Init();  // Reset reader state
         MFRC522::StatusCode status = mfrc522->PICC_WakeupA(bufferATQA, &bufferSize);
         if (status != MFRC522::STATUS_OK) {
+            consecutiveFailures++;
+            // After many failures, do a full PCD_Init once to recover from
+            // potential RC522 lockup (e.g. after ESD event or power glitch)
+            if (consecutiveFailures >= RFID_RECOVERY_THRESHOLD) {
+                mfrc522->PCD_Init();
+                consecutiveFailures = 0;
+            }
             return;  // Geen kaart aanwezig
         }
+        consecutiveFailures = 0;
     }
 
     // Selecteer de kaart
@@ -304,6 +318,7 @@ void rfidLoop() {
     if (!isNewCard) {
         // Halt PICC om stroom te besparen
         mfrc522->PICC_HaltA();
+        yield();  // Give WiFi/TCP stack time after SPI operations
         return;
     }
 
@@ -318,8 +333,7 @@ void rfidLoop() {
     Serial.printf("UID: %s (%d bytes)\n", uid, mfrc522->uid.size);
     Serial.printf("Tag type: %s\n", mfrc522->PICC_GetTypeName(piccType));
 
-#ifdef PLATFORM_ESP8266
-    // ESP8266: Minimal read - only page 4 (scent code) to save RAM
+    // Minimal read - only page 4 (scent code) to avoid blocking the main loop.
     // MIFARE_Read reads 16 bytes starting from page, so page 4 gives us pages 4-7
     byte buffer[18];  // 16 bytes + 2 CRC
     byte size = sizeof(buffer);
@@ -345,7 +359,7 @@ void rfidLoop() {
         // Lookup scent
         ScentInfo info = rfidLookupScent(page4Hex);
         if (info.valid) {
-            strncpy(lastScent, info.name.c_str(), sizeof(lastScent) - 1);
+            strncpy(lastScent, info.name, sizeof(lastScent) - 1);
             lastScent[sizeof(lastScent) - 1] = '\0';
             Serial.printf("[RFID] Matched scent: %s\n", lastScent);
         } else {
@@ -357,88 +371,6 @@ void rfidLoop() {
         strncpy(lastScent, "Read Error", sizeof(lastScent) - 1);
         lastScent[sizeof(lastScent) - 1] = '\0';
     }
-#else
-    // ESP32: Full debug dump (more RAM available)
-    Serial.printf("SAK: 0x%02X\n", mfrc522->uid.sak);
-
-    // Try to read memory pages (works for MIFARE Ultralight / NTAG)
-    Serial.println("\n--- Memory Dump (pages 0-44) ---");
-    byte buffer[18];
-    byte size;
-
-    // Collect all readable data for pattern analysis
-    String allHex = "";
-    String allAscii = "";
-
-    for (byte page = 0; page < 45; page += 4) {
-        size = sizeof(buffer);
-        MFRC522::StatusCode status = mfrc522->MIFARE_Read(page, buffer, &size);
-        if (status == MFRC522::STATUS_OK) {
-            for (byte p = 0; p < 4 && (page + p) < 45; p++) {
-                Serial.printf("Page %2d: ", page + p);
-                // Hex dump
-                for (byte i = 0; i < 4; i++) {
-                    Serial.printf("%02X ", buffer[p * 4 + i]);
-                    if (buffer[p * 4 + i] < 0x10) allHex += "0";
-                    allHex += String(buffer[p * 4 + i], HEX);
-                }
-                Serial.print(" | ");
-                // ASCII representation
-                for (byte i = 0; i < 4; i++) {
-                    byte c = buffer[p * 4 + i];
-                    char ch = (c >= 32 && c < 127) ? (char)c : '.';
-                    Serial.print(ch);
-                    allAscii += ch;
-                }
-                Serial.println();
-            }
-        } else {
-            Serial.printf("Page %2d: Read stopped (%s)\n", page, mfrc522->GetStatusCodeName(status));
-            break;
-        }
-    }
-
-    // Show combined data for easy pattern matching
-    allHex.toUpperCase();
-    Serial.println("\n--- Combined hex (for pattern search) ---");
-    Serial.println(allHex);
-    Serial.println("\n--- Combined ASCII ---");
-    Serial.println(allAscii);
-
-    Serial.println("===================================\n");
-
-    // Extract page 4 from the already collected data
-    // Page 4 = bytes 16-19, which is characters 32-39 in the hex string
-    String page4Hex = "";
-    String page4Ascii = "";
-
-    if (allHex.length() >= 40) {
-        page4Hex = allHex.substring(32, 40);  // 8 hex chars = 4 bytes
-        page4Hex.toUpperCase();
-        strncpy(lastScentCode, page4Hex.c_str(), sizeof(lastScentCode) - 1);
-        lastScentCode[sizeof(lastScentCode) - 1] = '\0';
-
-        // Extract ASCII from allAscii (characters 16-19)
-        if (allAscii.length() >= 20) {
-            page4Ascii = allAscii.substring(16, 20);
-        }
-        Serial.printf("[RFID] Page 4 hex: %s (ASCII: %s)\n", page4Hex.c_str(), page4Ascii.c_str());
-    } else {
-        Serial.println("[RFID] ERROR: Could not extract page 4 data");
-    }
-
-    // Lookup geur based on hex code from page 4
-    ScentInfo info = rfidLookupScent(page4Hex);
-    if (info.valid) {
-        strncpy(lastScent, info.name.c_str(), sizeof(lastScent) - 1);
-        lastScent[sizeof(lastScent) - 1] = '\0';
-        Serial.printf("[RFID] Matched scent: %s\n", lastScent);
-    } else {
-        // Show ASCII interpretation if no match
-        snprintf(lastScent, sizeof(lastScent), "Unknown: %s", page4Ascii.c_str());
-        Serial.printf("[RFID] Unknown scent - hex: %s, ascii: %s\n", page4Hex.c_str(), page4Ascii.c_str());
-    }
-#endif
 
     Serial.println("============================================\n");
 
@@ -447,14 +379,15 @@ void rfidLoop() {
 
     // Halt PICC
     mfrc522->PICC_HaltA();
-    mfrc522->PCD_StopCrypto1();
+
+    yield();  // Give WiFi/TCP stack time after SPI-heavy new card processing
 }
 
-String rfidGetLastUID() {
+const char* rfidGetLastUID() {
     return lastUID;
 }
 
-String rfidGetLastScent() {
+const char* rfidGetLastScent() {
     return lastScent;
 }
 
@@ -475,26 +408,24 @@ unsigned long rfidTimeSinceLastTag() {
     return millis() - lastTagTime;
 }
 
-ScentInfo rfidLookupScent(const String& hexData) {
+ScentInfo rfidLookupScent(const char* hexData) {
     ScentInfo info;
     info.valid = false;
-    info.name = "";
+    info.name = nullptr;
     info.hexCode = hexData;
 
-    // Normalize to uppercase for matching
-    String data = hexData;
-    data.toUpperCase();
-    const char* dataPtr = data.c_str();
+    if (hexData == nullptr || hexData[0] == '\0') return info;
 
-    // Search for hex codes in the tag data using direct C-string comparison
-    // This avoids creating String objects in the loop, reducing heap fragmentation
-    // memcpy_P reads from PROGMEM on ESP8266, and is regular memcpy on ESP32
+    // Normalize to uppercase for matching (page4Hex is already uppercase from snprintf %02X)
+    // Search scent table - compare first 6 chars of page4Hex (8 chars) against table entries (6 chars)
+    // This is a prefix match: the 8-char page4 hex starts with the 6-char scent code
     ScentEntry entry;
     for (int i = 0; ; i++) {
         memcpy_P(&entry, &scentTable[i], sizeof(ScentEntry));
         if (entry.uid == nullptr) break;
-        if (strstr(dataPtr, entry.uid) != nullptr) {
-            info.name = String(entry.name);
+        // Compare the 6-char scent code against the start of the page4 hex
+        if (strncmp(hexData, entry.uid, 6) == 0) {
+            info.name = entry.name;
             info.valid = true;
             Serial.printf("[RFID] Found hex pattern: %s\n", entry.uid);
             break;
@@ -510,6 +441,27 @@ bool rfidIsConnected() {
 
 uint8_t rfidGetVersionReg() {
     return rc522VersionReg;
+}
+
+void rfidSuspend() {
+    rfidSuspended = true;
+    // Halt any active card communication and turn off RF field to save power
+    if (mfrc522 != nullptr && rc522Connected) {
+        mfrc522->PICC_HaltA();
+        // Turn off antenna
+        mfrc522->PCD_AntennaOff();
+    }
+    Serial.println("[RFID] Suspended");
+}
+
+void rfidResume() {
+    rfidSuspended = false;
+    // Re-enable antenna for scanning
+    if (mfrc522 != nullptr && rc522Connected) {
+        mfrc522->PCD_AntennaOn();
+    }
+    consecutiveFailures = 0;  // Reset so recovery doesn't fire immediately
+    Serial.println("[RFID] Resumed");
 }
 
 #endif // RC522_ENABLED

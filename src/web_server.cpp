@@ -11,7 +11,7 @@
 #include <ArduinoJson.h>
 
 // RFID support for all platforms with RC522_ENABLED
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 #include "rfid_handler.h"
 #endif
 
@@ -296,8 +296,11 @@ void WebServer::setupRoutes() {
                 updateLedStatus();
                 updateContentLength = request->contentLength();
 
-                // Stop non-essential services to free memory
+                // Stop non-essential services to free memory and prevent interference
                 mqttHandler.disconnect();
+                #if RC522_ENABLED
+                rfidSuspend();  // Stop SPI operations that compete with TCP stack
+                #endif
 
                 #ifdef PLATFORM_ESP8266
                 if (!Update.begin(updateContentLength, U_FLASH)) {
@@ -365,8 +368,11 @@ void WebServer::setupRoutes() {
                 otaInProgress = true;
                 updateLedStatus();
 
-                // Stop non-essential services to free memory
+                // Stop non-essential services to free memory and prevent interference
                 mqttHandler.disconnect();
+                #if RC522_ENABLED
+                rfidSuspend();  // Stop SPI operations that compete with TCP stack
+                #endif
 
                 #ifdef PLATFORM_ESP8266
                 size_t fsSize = ((size_t)&_FS_end - (size_t)&_FS_start);
@@ -541,7 +547,7 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     #endif
 
     // RFID status
-    #if defined(RC522_ENABLED)
+    #if RC522_ENABLED
     doc["rfid"]["connected"] = rfidIsConnected();
     doc["rfid"]["has_tag"] = rfidHasTag();
     doc["rfid"]["cartridge_present"] = rfidIsCartridgePresent();  // Is cartridge NOW present?
@@ -586,7 +592,7 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     doc["mqtt"]["connected"] = mqttHandler.isConnected();
 
     // RFID status (only if enabled)
-    #if defined(RC522_ENABLED)
+    #if RC522_ENABLED
     doc["rfid"]["connected"] = rfidIsConnected();
     doc["rfid"]["cartridge_present"] = rfidIsCartridgePresent();
     doc["rfid"]["last_scent"] = rfidGetLastScent();

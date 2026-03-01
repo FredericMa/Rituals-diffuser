@@ -8,7 +8,7 @@
 #include <ArduinoJson.h>
 
 // RFID support for all platforms with RC522_ENABLED
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 #include "rfid_handler.h"
 #endif
 
@@ -196,14 +196,14 @@ void MQTTHandler::processPublishStateMachine() {
             break;
 
         case MqttPublishState::DISC_SCENT:
-            #if defined(RC522_ENABLED)
+            #if RC522_ENABLED
             publishScentSensorDiscovery();
             #endif
             _publishState = MqttPublishState::DISC_CARTRIDGE;
             break;
 
         case MqttPublishState::DISC_CARTRIDGE:
-            #if defined(RC522_ENABLED)
+            #if RC522_ENABLED
             publishCartridgeBinarySensorDiscovery();
             #endif
             _publishState = MqttPublishState::DISC_UPTIME;
@@ -293,7 +293,7 @@ void MQTTHandler::processPublishStateMachine() {
             break;
 
         case MqttPublishState::STATE_SCENT:
-            #if defined(RC522_ENABLED)
+            #if RC522_ENABLED
             {
                 // Publish scent name
                 String scent = rfidIsCartridgePresent() ? rfidGetLastScent() : "No cartridge";
@@ -674,7 +674,7 @@ void MQTTHandler::publishCurrentVersionSensorDiscovery() {
     }
 }
 
-#if defined(RC522_ENABLED)
+#if RC522_ENABLED
 void MQTTHandler::publishScentSensorDiscovery() {
     String b = getBaseTopic();
     String devId = "rituals_" + _deviceId;

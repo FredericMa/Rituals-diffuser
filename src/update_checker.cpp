@@ -42,6 +42,10 @@ void UpdateChecker::begin() {
 }
 
 void UpdateChecker::loop() {
+    // Don't run any network operations during firmware upload
+    extern bool otaInProgress;
+    if (otaInProgress) return;
+
     // Handle requested check
     if (_checkRequested && _state == UpdateCheckState::IDLE) {
         _checkRequested = false;
